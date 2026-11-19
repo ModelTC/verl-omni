@@ -43,7 +43,7 @@ from verl.single_controller.ray import (
 )
 from verl.single_controller.ray.base import split_resource_pool
 from verl.trainer.distillation import is_distillation_enabled
-from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics, process_validation_metrics
+from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, need_reference_policy
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
@@ -97,6 +97,11 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
+)
+from verl_omni.trainer.diffusion.validation_reward import (
+    append_validation_reward_extra,
+    extract_validation_reward,
+    process_validation_reward_metrics,
 )
 from verl_omni.utils.net_utils import worker_group_port_ranges
 from verl_omni.workers.config.reward import (
@@ -199,6 +204,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         validate_distillation_config(config)
         self._teacher_one_step_off = self.use_teacher_policy and self.distillation_config.scheduler == "one_step_off"
         self._pending_teacher_batch = None
+        self._rollout_batch_validator = None
+        self._rollout_batch_expected_uids = None
+        self._configure_rollout_batch_validator()
         self.replay_buffer = self._build_replay_buffer()
 
         # ref_in_actor: reference policy is the actor without lora applied.
@@ -212,6 +220,57 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         # Local update index within the parameter-sync cycle.
         self.local_trigger_step = 0
         self._nonfinite_grad_streak = 0
+
+    def _configure_rollout_batch_validator(self):
+        """An optional batch guard requires one submission per synchronous sample."""
+        validator_fqn = self.config.trainer.get("rollout_batch_validator")
+        if not validator_fqn:
+            return
+        sampler = self.config.trainer.v1.sampler
+        gen_batch_size = self.config.data.get("gen_batch_size") or self.config.data.train_batch_size
+        if (
+            self.trainer_mode != "sync"
+            or self.parameter_sync_step != 1
+            or gen_batch_size != self.config.data.train_batch_size
+            or self._teacher_one_step_off
+            or self._should_prefetch_local_batches()
+            or sampler.get("drop_incomplete_groups", False)
+            or sampler.get("sync_refill_failed_groups", False)
+            or self.config.algorithm.get("filter_groups", {}).get("enable", False)
+        ):
+            raise ValueError(
+                "trainer.rollout_batch_validator requires synchronous one-batch sampling: "
+                "trainer_mode='sync', parameter_sync_step=1, gen_batch_size=train_batch_size, "
+                "and no teacher one_step_off, prefetch, group filtering, or failed-group refill."
+            )
+        from verl.utils.import_utils import load_class_from_fqn
+
+        validator = load_class_from_fqn(validator_fqn, "rollout batch validator")
+        if not callable(validator):
+            raise TypeError("trainer.rollout_batch_validator must resolve to a callable")
+        self._rollout_batch_validator = validator
+
+    def _validate_rollout_batch(self, batch_meta, expected_uids, num_candidates, global_step):
+        validator = self._rollout_batch_validator
+        if validator is None:
+            return
+        # sample() clears prompt keys from TQ when materializing the batch, but
+        # retains the terminal metadata snapshot. Do not resync that snapshot.
+        group_statuses = {}
+        for status in ("pending", "running", "finished", "failure"):
+            status_keys = getattr(self.replay_buffer, f"{status}_keys")[batch_meta.partition_id]
+            group_statuses.update((uid, status) for uid in expected_uids if uid in status_keys)
+        try:
+            validator(
+                keys=batch_meta.keys,
+                tags=batch_meta.tags,
+                expected_uids=expected_uids,
+                group_statuses=group_statuses,
+                num_candidates=num_candidates,
+                global_step=global_step,
+            )
+        except RuntimeError as error:
+            raise RuntimeError(f"Rollout batch partition={batch_meta.partition_id}: {error}") from error
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
@@ -341,7 +400,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         # initialize SkipManager for V1 rollout skip support (no-op until configured).
         SkipManager.init(self.config)
 
-        self.logger = Tracking(
+        tracking_cls = Tracking
+        if tracking_fqn := self.config.trainer.get("tracking_class"):
+            from verl.utils.import_utils import load_class_from_fqn
+
+            tracking_cls = load_class_from_fqn(tracking_fqn, "Tracking")
+        self.logger = tracking_cls(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
@@ -1220,11 +1284,34 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Use the upstream replay buffer and replace only selected failed groups."""
         sampler_config = self.config.trainer.v1.sampler
         if not sampler_config.get("drop_incomplete_groups", False):
-            batch_meta, off_policy_metrics = self.replay_buffer.sample(
-                global_steps=self.global_steps,
-                partition_id="train",
-                batch_size=batch_size,
-            )
+            if self._rollout_batch_validator is not None:
+                expected_uids = self._rollout_batch_expected_uids
+                if expected_uids is None or len(expected_uids) != batch_size:
+                    raise RuntimeError("Rollout batch validation requires one complete submitted prompt batch")
+            try:
+                batch_meta, off_policy_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="train",
+                    batch_size=batch_size,
+                )
+            except RuntimeError as error:
+                no_trajectories = "Sync replay buffer selected terminal groups with no materializable trajectories."
+                if self._rollout_batch_validator is None or str(error) not in (
+                    no_trajectories,
+                    no_trajectories
+                    + " Enable trainer.v1.sampler.sync_refill_failed_groups to replace failed groups.",
+                ):
+                    raise
+                batch_meta = KVBatchMeta(partition_id="train", keys=[], tags=[])
+                off_policy_metrics = {}
+            if self._rollout_batch_validator is not None:
+                self._validate_rollout_batch(
+                    batch_meta,
+                    expected_uids=self._rollout_batch_expected_uids,
+                    num_candidates=self.config.actor_rollout_ref.rollout.n,
+                    global_step=self.global_steps,
+                )
+                self._rollout_batch_expected_uids = None
             # Restore the v0 prompt-major row order before any consumer reads
             # or writes these keys (TQ key order is storage-arbitrary).
             return canonicalize_diffusion_tq_meta(batch_meta), off_policy_metrics
@@ -1306,6 +1393,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         }
 
     def _submit_batch_to_rollout(self, batch) -> int:
+        if self._rollout_batch_validator is not None:
+            if (
+                self._rollout_batch_expected_uids is not None
+                or len(batch) != self.config.data.train_batch_size
+                or self._should_prefetch_local_batches()
+                or self.replay_buffer.filter_groups_metric is not None
+                or self.replay_buffer.sync_refill_failed_groups
+            ):
+                raise RuntimeError("Rollout batch validation requires one unfiltered submission per sample")
+            self._rollout_batch_expected_uids = tuple(batch["uid"])
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             from tensordict.tensorclass import NonTensorData
@@ -1514,6 +1611,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         sample_uids: list = []
         data_sources: list = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        validation_media = None
+        if media_fqn := self.config.trainer.get("validation_media_class"):
+            from verl.utils.import_utils import load_class_from_fqn
+
+            media_cls = load_class_from_fqn(media_fqn, "ValidationMedia")
+            validation_media = media_cls(self.config, self.global_steps)
 
         for batch_dict in self.val_dataloader:
             batch_dict["uid"] = np.array(
@@ -1528,12 +1631,21 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             tags = [
                 {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
             ]
+            if self._rollout_batch_validator is not None:
+                expected_uids = tuple(batch["uid"])
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
 
             batch_meta, _ = self.replay_buffer.sample(
                 global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
             )
+            if self._rollout_batch_validator is not None:
+                self._validate_rollout_batch(
+                    batch_meta,
+                    expected_uids=expected_uids,
+                    num_candidates=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                    global_step=self.global_steps,
+                )
             batch_meta = canonicalize_diffusion_tq_meta(batch_meta)
             data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
 
@@ -1571,7 +1683,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 num_real,
             )
             sample_inputs.extend(input_texts)
-            sample_outputs.append(output_images)
+            if validation_media is None:
+                sample_outputs.append(output_images)
             tool_extra = data.non_tensor_batch.get("tool_extra_fields")
             sample_audios.extend(_resolve_rollout_media_field(data, tool_extra, "audio"))
             sample_audio_sample_rates.extend(_resolve_rollout_media_field(data, tool_extra, "audio_sample_rate"))
@@ -1579,15 +1692,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             uids = data.non_tensor_batch.get("uid")
             sample_uids.extend(list(uids) if uids is not None else [None] * len(data))
 
-            reward_tensor, reward_extra_info = extract_reward(data)
+            reward_tensor, reward_extra_info = extract_validation_reward(data)
             scores = reward_tensor.sum(-1).cpu().tolist()
+            append_validation_reward_extra(
+                reward_extra_infos_dict, reward_extra_info,
+                previous_samples=len(sample_scores), batch_size=len(scores),
+            )
             sample_scores.extend(scores)
             reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
 
             if "__num_turns__" in data.non_tensor_batch:
                 sample_turns.append(data.non_tensor_batch["__num_turns__"])
@@ -1599,7 +1711,17 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             else:
                 sample_gts.extend([None] * len(data))
 
+            if validation_media is not None:
+                validation_media.collect(data, input_texts, reward_extra_info)
             tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
+
+        if validation_media is not None:
+            try:
+                validation_media.log()
+            except Exception:
+                logger.exception("Validation media logging failed at step %s", self.global_steps)
+            data_sources_arr = np.concatenate(data_sources, axis=0) if data_sources else np.array([])
+            return self._val_metrics_update(data_sources_arr, sample_uids, reward_extra_infos_dict, sample_turns)
 
         sample_outputs = torch.cat(sample_outputs, dim=0) if sample_outputs else torch.empty(0)
         self._maybe_log_val_generations(
@@ -1739,7 +1861,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict:
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        data_src2var2metric2val = process_validation_reward_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"

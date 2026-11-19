@@ -37,6 +37,9 @@ class DiffusionLossResult:
     loss: torch.Tensor
     metrics: dict[str, Any]
     add_loss_metric: bool = False
+    # Custom objectives may include their own reference-policy regularization.
+    # The worker still requests reference outputs when use_kl_loss is enabled.
+    includes_kl_loss: bool = False
 
 
 def _format_available_keys(mapping: Any) -> str:

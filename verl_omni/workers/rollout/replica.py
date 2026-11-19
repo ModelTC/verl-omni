@@ -15,12 +15,12 @@ import asyncio
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.rollout.replica import RolloutReplicaRegistry
 from verl.workers.rollout.utils import update_prometheus_config
 
+from verl_omni.utils.config import instantiate_config
 from verl_omni.workers.config import DiffusionRolloutConfig
 from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size, get_rollout_world_size
 
@@ -49,7 +49,7 @@ class DiffusionLLMServerManager(LLMServerManager):
 
         # TODO: replace this lifecycle override with the replica-size hook once the verl pin includes
         # https://github.com/verl-project/verl/pull/8070. The lifecycle test compares against the current pin.
-        config = omega_conf_to_dataclass(self.rollout_config, dataclass_type=DiffusionRolloutConfig)
+        config = instantiate_config(self.rollout_config, DiffusionRolloutConfig)
         start_rank = self.start_rank if start_rank is None else start_rank
         replica_size = get_rollout_world_size(config)
         world_size = self.worker_group.world_size if self.worker_group else config.n_gpus_per_node * config.nnodes

@@ -115,6 +115,16 @@ class DiffusionModelBase(ABC):
         return True
 
     @classmethod
+    def cast_forward_inputs(cls) -> bool:
+        """Whether FSDP may cast every floating model input to parameter dtype.
+
+        Adapters with precision-sensitive conditioning (for example fractional
+        timesteps) may return False and explicitly cast only activation inputs
+        in prepare_model_inputs. This leaves the default behavior unchanged.
+        """
+        return True
+
+    @classmethod
     def get_fsdp_ignored_module_names(cls, model_config) -> list[str]:
         """Submodule name components to leave unsharded under FSDP2 (default: none).
 

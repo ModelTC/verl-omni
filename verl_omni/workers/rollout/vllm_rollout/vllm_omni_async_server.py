@@ -16,12 +16,12 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import asdict
+from copy import deepcopy
+from dataclasses import MISSING, asdict, fields, is_dataclass
 from typing import Any, Optional
 
 import ray
 import torch
-import vllm_omni.entrypoints.cli.serve
 from verl.utils.profiler import build_rollout_dist_profiler
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
@@ -37,8 +37,10 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, 
 from vllm.entrypoints.openai.api_server import build_app
 from vllm_omni.engine.arg_utils import OmniEngineArgs, OrchestratorArgs, orchestrator_field_names
 from vllm_omni.entrypoints import AsyncOmni
+from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.entrypoints.openai.api_server import omni_init_app_state
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 from verl_omni.utils.net_utils import get_non_ephemeral_free_port
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig, OmniModelConfig
@@ -91,12 +93,31 @@ def _restore_raw_compilation_config(engine_args: dict, args: Any) -> None:
         engine_args["compilation_config"] = raw_compilation_config
 
 
+def _dataclass_defaults(cls: type) -> dict:
+    """Read declared defaults without constructing an engine argument object.
+
+    EngineArgs.__post_init__ resolves model paths in offline mode and loads
+    plugins. Neither belongs in default inspection. Nested config factories
+    still run so their normalized defaults match the real engine arguments.
+    """
+    defaults = {}
+    for field in fields(cls):
+        if field.default is not MISSING:
+            value = field.default
+        elif field.default_factory is not MISSING:
+            value = field.default_factory()
+        else:
+            continue
+        defaults[field.name] = asdict(value) if is_dataclass(value) and not isinstance(value, type) else deepcopy(value)
+    return defaults
+
+
 def _drop_defaulted_engine_args(engine_args: dict) -> dict:
     """Keep only explicitly-set engine arguments, dropping upstream defaults."""
     global _ENGINE_ARGS_DEFAULTS
     if _ENGINE_ARGS_DEFAULTS is None:
-        defaults = asdict(OmniEngineArgs(model=""))
-        defaults.update(asdict(OrchestratorArgs()))
+        defaults = _dataclass_defaults(OmniEngineArgs)
+        defaults.update(_dataclass_defaults(OrchestratorArgs))
         _ENGINE_ARGS_DEFAULTS = defaults
     defaults = _ENGINE_ARGS_DEFAULTS
     return {
@@ -104,6 +125,26 @@ def _drop_defaulted_engine_args(engine_args: dict) -> dict:
         for key, value in engine_args.items()
         if key == "model" or key not in defaults or not _is_defaulted_value(key, value, defaults[key])
     }
+
+
+class _RolloutArgumentParser(TrackingArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        parsed, remaining = super().parse_known_args(args, namespace)
+        # The parent verl parser copies the subcommand's namespace attributes.
+        parsed.rollout_explicit_keys = parsed.explicit_keys
+        return parsed, remaining
+
+
+class _RolloutServeCommand(OmniServeCommand):
+    def subparser_init(self, subparsers):
+        # verl creates a plain FlexibleArgumentParser. Only the Omni
+        # subcommand needs the tracking parser required by the fork.
+        parser_class = subparsers._parser_class
+        subparsers._parser_class = _RolloutArgumentParser
+        try:
+            return super().subparser_init(subparsers)
+        finally:
+            subparsers._parser_class = parser_class
 
 
 class vLLMOmniHttpServer(vLLMHttpServer):
@@ -188,7 +229,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         return self._generate_strategy.worker_extension_cls(device_type)
 
     def _get_cli_modules(self) -> list:
-        return [vllm_omni.entrypoints.cli.serve]
+        return [self]
+
+    @staticmethod
+    def cmd_init():
+        return [_RolloutServeCommand()]
 
     def _get_cli_description(self) -> str:
         return "vLLM-Omni CLI"
@@ -201,28 +246,37 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # -----------------------------------------------------------------------
 
     async def run_server(self, args: argparse.Namespace):
-        engine_args = OmniEngineArgs.from_cli_args(args)
-        engine_args = asdict(engine_args)
+        explicit_keys = getattr(args, "rollout_explicit_keys", None)
+        if explicit_keys is None:
+            engine_args = OmniEngineArgs.from_cli_args(args)
+            engine_args = asdict(engine_args)
 
-        # TODO (mike): drop this patch once vllm-omni strips the serialized default
-        # fault_tolerance_config at its kwargs boundary, or vLLM defaults it to None —
-        # any dict is read as an explicit --fault-tolerance-config and auto-enabled,
-        # failing without an external load balancer.
-        if not engine_args.get("enable_fault_tolerance"):
-            engine_args.pop("fault_tolerance_config", None)
+            # TODO (mike): drop this patch once vllm-omni strips the serialized default
+            # fault_tolerance_config at its kwargs boundary, or vLLM defaults it to None —
+            # any dict is read as an explicit --fault-tolerance-config and auto-enabled,
+            # failing without an external load balancer.
+            if not engine_args.get("enable_fault_tolerance"):
+                engine_args.pop("fault_tolerance_config", None)
 
-        # ``from_cli_args`` only retains OmniEngineArgs fields. Restore the
-        # OrchestratorArgs fields forwarded by verl before creating AsyncOmni.
-        for key in orchestrator_field_names() - engine_args.keys():
-            value = getattr(args, key, None)
-            if value is not None:
-                engine_args[key] = value
+            # ``from_cli_args`` only retains OmniEngineArgs fields. Restore the
+            # OrchestratorArgs fields forwarded by verl before creating AsyncOmni.
+            for key in orchestrator_field_names() - engine_args.keys():
+                value = getattr(args, key, None)
+                if value is not None:
+                    engine_args[key] = value
 
-        # Restore raw user mapping so compilation runtime fields do not fail stage config validation.
-        _restore_raw_compilation_config(engine_args, args)
+            # Restore raw user mapping so compilation runtime fields do not fail stage config validation.
+            _restore_raw_compilation_config(engine_args, args)
 
-        # Forward only explicitly-set engine args; stage config rejects unowned defaults.
-        engine_args = _drop_defaulted_engine_args(engine_args)
+            # Forward only explicitly-set engine args; stage config rejects unowned defaults.
+            engine_args = _drop_defaulted_engine_args(engine_args)
+        else:
+            engine_args = {
+                key: getattr(args, key)
+                for key in explicit_keys - {"model_tag", "subparser", "dispatch_function"}
+            }
+            engine_args["model"] = args.model
+
         # This rollout setting is explicit even when its value matches the
         # OmniEngineArgs default, so restore it after default filtering.
         engine_args["log_stats"] = not self.config.disable_log_stats

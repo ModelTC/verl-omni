@@ -171,6 +171,16 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed ``advantages`` and ``returns`` in its batch.
     """
+    custom_function = config.get("custom_advantage_function") if config is not None else None
+    if custom_function:
+        function = load_class_from_fqn(custom_function, "diffusion advantage function")
+        if not callable(function):
+            raise TypeError(f"Diffusion advantage function {custom_function!r} is not callable")
+        advantages, returns = function(data=data, config=config)
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        return data
+
     adv_kwargs = {
         "sample_level_rewards": data.batch["sample_level_rewards"],
         "config": config,
@@ -326,7 +336,9 @@ def dump_generations(
     else:
         images_pil = outputs[:n].cpu().permute(0, 2, 3, 1).numpy()
         for i, image in enumerate(images_pil):
-            image_path = os.path.join(visual_folder, f"{i}.jpg")
+            # JPEG cannot retain an image model's transparency channel.
+            extension = "png" if image.shape[-1] == 4 else "jpg"
+            image_path = os.path.join(visual_folder, f"{i}.{extension}")
             try:
                 Image.fromarray(image).save(image_path)
             except (OSError, ValueError) as error:

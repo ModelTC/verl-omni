@@ -17,12 +17,12 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from vllm_omni.lora.request import LoRARequest
 
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
+from verl_omni.utils.config import instantiate_config
 
 if TYPE_CHECKING:
     from argparse import Namespace
@@ -88,7 +88,7 @@ class OmniStrategyBase(ABC):
         Returns:
             The mode's rollout-config dataclass instance.
         """
-        return omega_conf_to_dataclass(config, dataclass_type=self.rollout_config_cls)
+        return instantiate_config(config, self.rollout_config_cls)
 
     def init_model_config(self, model_config: Any) -> Any:
         """Convert the raw model config into :attr:`model_config_cls`.
@@ -99,7 +99,7 @@ class OmniStrategyBase(ABC):
         Returns:
             The mode's model-config dataclass instance.
         """
-        return omega_conf_to_dataclass(model_config, dataclass_type=self.model_config_cls)
+        return instantiate_config(model_config, self.model_config_cls)
 
     def validate_configs(self) -> None:
         """Validate/normalize ``self.server.config`` after it is built.

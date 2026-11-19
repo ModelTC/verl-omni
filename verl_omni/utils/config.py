@@ -9,6 +9,19 @@ from __future__ import annotations
 from typing import Any
 
 
+def instantiate_config(config: Any, base_type: type) -> Any:
+    """Honor a declared config subclass and validate the runtime's base contract."""
+    from verl.utils.config import omega_conf_to_dataclass
+
+    if isinstance(config, base_type):
+        return config
+    target = config.get("_target_") if hasattr(config, "get") else None
+    result = omega_conf_to_dataclass(config, dataclass_type=None if target else base_type)
+    if not isinstance(result, base_type):
+        raise TypeError(f"Config target must produce {base_type.__name__}, got {type(result).__name__}.")
+    return result
+
+
 def _select(config: Any, path: str, default: Any = None) -> Any:
     value = config
     for part in path.split("."):

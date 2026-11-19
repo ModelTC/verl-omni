@@ -420,6 +420,8 @@ class VeOmniDiffusionEngine(BaseEngine):
         )
 
     def prepare_model_outputs(self, output, micro_batch: TensorDict):
+        if isinstance(output, dict):
+            return output
         log_prob, prev_sample_mean, std_dev_t, sqrt_dt = output
         return {
             "log_probs": log_prob,
